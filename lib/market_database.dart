@@ -1,3 +1,5 @@
+import 'dart:convert';
+
 import 'package:path/path.dart' as path;
 import 'package:sqflite/sqflite.dart';
 
@@ -83,12 +85,47 @@ class MarketTransaction {
       };
 }
 
+class SavedBuilding {
+  const SavedBuilding({
+    required this.id,
+    required this.x,
+    required this.y,
+    required this.type,
+    required this.products,
+  });
+
+  final int id;
+  final int x;
+  final int y;
+  final String type;
+  final List<String> products;
+
+  factory SavedBuilding.fromMap(Map<String, Object?> map) {
+    return SavedBuilding(
+      id: map['id'] as int,
+      x: map['x'] as int,
+      y: map['y'] as int,
+      type: map['type'] as String,
+      products: List<String>.from(
+        jsonDecode(map['products'] as String) as List<dynamic>,
+      ),
+    );
+  }
+
+  Map<String, Object?> toMap() => {
+        'x': x,
+        'y': y,
+        'type': type,
+        'products': jsonEncode(products),
+      };
+}
+
 class MarketDatabase {
   MarketDatabase._();
 
   static final MarketDatabase instance = MarketDatabase._();
   static const _databaseName = 'market_transactions.db';
-  static const _databaseVersion = 1;
+  static const _databaseVersion = 2;
 
   Database? _database;
 
@@ -122,6 +159,28 @@ class MarketDatabase {
         await database.execute(
           'CREATE INDEX transactions_type_idx ON transactions(type)',
         );
+        await database.execute('''
+          CREATE TABLE buildings (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            x INTEGER NOT NULL,
+            y INTEGER NOT NULL,
+            type TEXT NOT NULL,
+            products TEXT NOT NULL
+          )
+        ''');
+      },
+      onUpgrade: (database, oldVersion, newVersion) async {
+        if (oldVersion < 2) {
+          await database.execute('''
+            CREATE TABLE buildings (
+              id INTEGER PRIMARY KEY AUTOINCREMENT,
+              x INTEGER NOT NULL,
+              y INTEGER NOT NULL,
+              type TEXT NOT NULL,
+              products TEXT NOT NULL
+            )
+          ''');
+        }
       },
     );
     return _database!;
@@ -145,12 +204,39 @@ class MarketDatabase {
 
   Future<int> count() async {
     final db = await database;
-    final result = await db.rawQuery('SELECT COUNT(*) AS total FROM transactions');
+    final result =
+        await db.rawQuery('SELECT COUNT(*) AS total FROM transactions');
     return Sqflite.firstIntValue(result) ?? 0;
   }
 
   Future<void> clear() async {
     final db = await database;
     await db.delete('transactions');
+  }
+
+  Future<int> insertBuilding(SavedBuilding building) async {
+    final db = await database;
+    return db.insert('buildings', building.toMap());
+  }
+
+  Future<List<SavedBuilding>> allBuildings() async {
+    final db = await database;
+    final rows = await db.query('buildings', orderBy: 'id');
+    return rows.map(SavedBuilding.fromMap).toList();
+  }
+
+  Future<void> updateBuilding(int id, List<String> products) async {
+    final db = await database;
+    await db.update(
+      'buildings',
+      {'products': jsonEncode(products)},
+      where: 'id = ?',
+      whereArgs: [id],
+    );
+  }
+
+  Future<void> deleteBuilding(int id) async {
+    final db = await database;
+    await db.delete('buildings', where: 'id = ?', whereArgs: [id]);
   }
 }

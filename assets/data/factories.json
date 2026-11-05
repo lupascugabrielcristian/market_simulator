@@ -1,0 +1,44 @@
+{
+  "products": [
+    {
+      "id": "bread",
+      "name": "Bread",
+      "basePrice": 5.0,
+      "outputPerDay": 25,
+      "consumerDemand": 0.160,
+      "inputs": { "grain": 2 }
+    },
+    {
+      "id": "brick",
+      "name": "Brick",
+      "basePrice": 8.0,
+      "outputPerDay": 20,
+      "consumerDemand": 0.010,
+      "inputs": { "stone": 2 }
+    },
+    {
+      "id": "cloths",
+      "name": "Cloths",
+      "basePrice": 14.0,
+      "outputPerDay": 12,
+      "consumerDemand": 0.030,
+      "inputs": { "cotton": 2 }
+    },
+    {
+      "id": "tools",
+      "name": "Tools",
+      "basePrice": 20.0,
+      "outputPerDay": 10,
+      "consumerDemand": 0.015,
+      "inputs": { "wood": 1, "iron": 1 }
+    },
+    {
+      "id": "car",
+      "name": "Car",
+      "basePrice": 120.0,
+      "outputPerDay": 3,
+      "consumerDemand": 0.004,
+      "inputs": { "aluminium": 3, "iron": 2, "tools": 1 }
+    }
+  ]
+}

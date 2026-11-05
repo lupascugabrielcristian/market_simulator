@@ -3,17 +3,22 @@ import 'dart:math';
 import 'package:flutter/material.dart';
 
 import 'market_database.dart';
+import 'product_catalog.dart';
 
 void main() => runApp(const MarketSimulationApp());
 
 class MarketSimulationApp extends StatelessWidget {
   const MarketSimulationApp({super.key});
 
+  static final GlobalKey<NavigatorState> navigatorKey =
+      GlobalKey<NavigatorState>();
+
   @override
   Widget build(BuildContext context) {
     const navy = Color(0xFF102A43);
     return MaterialApp(
       debugShowCheckedModeBanner: false,
+      navigatorKey: navigatorKey,
       title: 'Market Simulation',
       theme: ThemeData(
         useMaterial3: true,
@@ -41,34 +46,6 @@ enum Terrain { grass, forest, water, mountain }
 
 enum BuildingType { store, company, factory, extractor, warehouse }
 
-enum ProductType { bread, fruit, tools }
-
-extension ProductTypeInfo on ProductType {
-  String get label => switch (this) {
-        ProductType.bread => 'Bread',
-        ProductType.fruit => 'Fruit',
-        ProductType.tools => 'Tools',
-      };
-
-  IconData get icon => switch (this) {
-        ProductType.bread => Icons.bakery_dining_rounded,
-        ProductType.fruit => Icons.apple_rounded,
-        ProductType.tools => Icons.handyman_rounded,
-      };
-
-  double get basePrice => switch (this) {
-        ProductType.bread => 4.0,
-        ProductType.fruit => 6.0,
-        ProductType.tools => 18.0,
-      };
-
-  List<ProductType> get producedBy => switch (this) {
-        ProductType.bread => [ProductType.bread],
-        ProductType.fruit => [ProductType.fruit],
-        ProductType.tools => [ProductType.tools],
-      };
-}
-
 extension BuildingTypeInfo on BuildingType {
   String get label => switch (this) {
         BuildingType.store => 'Store',
@@ -94,21 +71,16 @@ extension BuildingTypeInfo on BuildingType {
         BuildingType.warehouse => 800,
       };
 
-  int get production => switch (this) {
-        BuildingType.store => 0,
-        BuildingType.company => 0,
-        BuildingType.factory => 30,
-        BuildingType.extractor => 18,
-        BuildingType.warehouse => 0,
+  int get storageCapacity => switch (this) {
+        BuildingType.store => 60,
+        BuildingType.company => 100,
+        BuildingType.factory => 50,
+        BuildingType.extractor => 60,
+        BuildingType.warehouse => 250,
       };
 
-  List<ProductType> get allowedProducts => switch (this) {
-        BuildingType.store => ProductType.values,
-        BuildingType.company => ProductType.values,
-        BuildingType.factory => ProductType.values,
-        BuildingType.extractor => ProductType.values,
-        BuildingType.warehouse => ProductType.values,
-      };
+  bool get isProducer =>
+      this == BuildingType.factory || this == BuildingType.extractor;
 }
 
 class City {
@@ -121,24 +93,42 @@ class City {
   double averageSalary = 1200;
   int jobOpportunities = 0;
 
-  final Map<ProductType, int> stock = {};
-  final Map<ProductType, double> prices = {};
-  final Map<ProductType, int> sold = {};
-  final Map<ProductType, int> produced = {};
+  final Map<String, int> stock = {};
+  final Map<String, double> prices = {};
+  final Map<String, int> sold = {};
+  final Map<String, int> produced = {};
 
   List<City> tradePartners = [];
 }
 
 class Building {
-  Building(this.type, this.x, this.y, {Set<ProductType>? products})
-      : products = products == null
-            ? <ProductType>{}
-            : Set<ProductType>.from(products);
+  Building(
+    this.type,
+    this.x,
+    this.y, {
+    Set<String>? products,
+    Set<String>? storeAccepts,
+    this.inputWarehouseId,
+  })  : id = _nextId++,
+        products = Set<String>.from(products ?? const {}),
+        storeAccepts = Set<String>.from(storeAccepts ?? const {});
 
+  static int _nextId = 1;
+
+  final int id;
   final BuildingType type;
   final int x;
   final int y;
-  final Set<ProductType> products;
+
+  /// For factory/extractor: what they produce.
+  /// For warehouse: what they store.
+  final Set<String> products;
+
+  /// For store: which products it sells to consumers.
+  final Set<String> storeAccepts;
+
+  /// For factory: the warehouse it draws inputs from.
+  int? inputWarehouseId;
 }
 
 class Tile {
@@ -166,8 +156,8 @@ class _GameScreenState extends State<GameScreen> {
   int _cityId = 0;
   int _totalConsumers = 0;
   int _tradesToday = 0;
+  DateTime? _lastDialogClosedAt;
   final bool _showCities = true;
-  final Set<ProductType> _selectedProducts = {};
 
   static const int mapWidth = 20;
   static const int mapHeight = 80;
@@ -186,8 +176,16 @@ class _GameScreenState extends State<GameScreen> {
   @override
   void initState() {
     super.initState();
-    _generateWorld();
+    if (ProductCatalog.instance.isLoaded) {
+      _generateWorld();
+    } else {
+      ProductCatalog.instance.load().then((_) {
+        if (mounted) setState(() => _generateWorld());
+      });
+    }
   }
+
+  ProductCatalog get _catalog => ProductCatalog.instance;
 
   void _generateWorld() {
     _tiles.clear();
@@ -199,7 +197,6 @@ class _GameScreenState extends State<GameScreen> {
     _cityId = 0;
     _totalConsumers = 0;
     _tradesToday = 0;
-    _selectedProducts.clear();
 
     for (var y = 0; y < mapHeight; y++) {
       for (var x = 0; x < mapWidth; x++) {
@@ -235,19 +232,23 @@ class _GameScreenState extends State<GameScreen> {
       0,
       City('Your Capital', capital.x, capital.y, capital.population),
     );
-    _buildings.add(Building(
-      BuildingType.store,
-      capital.x,
-      capital.y,
-      products: ProductType.values.toSet(),
-    ));
+
+    // Give each city a starting warehouse
+    for (final city in _cities) {
+      _buildings.add(Building(
+        BuildingType.warehouse,
+        city.x,
+        city.y,
+        products: _catalog.allProducts.map((p) => p.id).toSet(),
+      ));
+    }
 
     for (final city in _cities) {
-      for (final product in ProductType.values) {
-        city.stock[product] = 0;
-        city.prices[product] = product.basePrice;
-        city.sold[product] = 0;
-        city.produced[product] = 0;
+      for (final product in _catalog.allProducts) {
+        city.stock[product.id] = 0;
+        city.prices[product.id] = product.basePrice;
+        city.sold[product.id] = 0;
+        city.produced[product.id] = 0;
       }
       city.tradePartners = _cities
           .where((other) => other != city)
@@ -325,13 +326,28 @@ class _GameScreenState extends State<GameScreen> {
     return null;
   }
 
+  List<Building> _buildingsNear(City city, {int range = 1}) {
+    return _buildings
+        .where((b) =>
+            (b.x - city.x).abs() <= range && (b.y - city.y).abs() <= range)
+        .toList();
+  }
+
   void _handleTileTap(int x, int y) {
+    if (_dialogSettling()) return;
     final tile = _tiles['$x,$y'];
     if (tile == null) return;
 
     if (_selectedBuilding == null) {
-      final city = _cityAt(x, y);
-      if (city != null) _showCityPopup(city);
+      // A building on the exact tile takes priority over the city dialog.
+      final building =
+          _buildings.where((b) => b.x == x && b.y == y).firstOrNull;
+      if (building != null) {
+        _showBuildingPopup(building);
+      } else {
+        final city = _cityAt(x, y);
+        if (city != null) _showCityPopup(city);
+      }
       return;
     }
 
@@ -354,19 +370,24 @@ class _GameScreenState extends State<GameScreen> {
     }
 
     final type = _selectedBuilding!;
-    if (type != BuildingType.company &&
-        type != BuildingType.warehouse &&
-        _selectedProducts.isEmpty) {
-      _showPopup('Select a product',
-          'Choose what this ${type.label.toLowerCase()} will handle.');
+    if (type.isProducer) {
+      _showProductionChoice(type, x, y);
+      return;
+    }
+    if (type == BuildingType.store) {
+      _showStoreConfigChoice(x, y);
+      return;
+    }
+    if (type == BuildingType.warehouse) {
+      _showWarehouseConfigChoice(x, y);
       return;
     }
 
+    // company — no config needed
     setState(() {
       _cash -= type.cost;
-      _buildings.add(Building(type, x, y, products: _selectedProducts));
+      _buildings.add(Building(type, x, y));
       _selectedBuilding = null;
-      _selectedProducts.clear();
     });
     _recordTransaction(MarketTransaction(
       day: _day,
@@ -382,7 +403,168 @@ class _GameScreenState extends State<GameScreen> {
       createdAt: DateTime.now(),
     ));
     _showPopup('Business established',
-        'Your new ${_buildings.last.type.label.toLowerCase()} is operating.');
+        'Your new ${type.label.toLowerCase()} is operating.');
+  }
+
+  void _showProductionChoice(BuildingType type, int x, int y) {
+    final available =
+        type == BuildingType.factory
+            ? _catalog.factoryProducts
+            : _catalog.extractorProducts;
+    _dialog<String>(
+      (context) => SimpleDialog(
+        title: Text(
+          type == BuildingType.factory
+              ? 'Choose factory production'
+              : 'Choose extractor output',
+        ),
+        children: available
+            .map((product) => SimpleDialogOption(
+                  onPressed: () => Navigator.pop(context, product.id),
+                  child: ListTile(
+                    leading: Icon(product.icon),
+                    title: Text(product.name),
+                    subtitle: Text(
+                      '${product.outputPerDay} units/day · \$${product.basePrice.toStringAsFixed(2)}',
+                    ),
+                  ),
+                ))
+            .toList(),
+      ),
+    ).then((productId) {
+      if (!mounted || productId == null) return;
+      _placeBuilding(type, x, y, {productId});
+    });
+  }
+
+  void _showStoreConfigChoice(int x, int y) {
+    final allIds = _catalog.allProducts.map((p) => p.id).toSet();
+    _dialog<Set<String>>(
+      (context) => _MultiSelectDialog(
+        title: 'Choose store inventory',
+        items: _catalog.allProducts,
+        initialSelected: allIds,
+      ),
+    ).then((selected) {
+      if (!mounted || selected == null) return;
+      _placeBuilding(BuildingType.store, x, y, {}, storeAccepts: selected);
+    });
+  }
+
+  void _showWarehouseConfigChoice(int x, int y) {
+    final allIds = _catalog.allProducts.map((p) => p.id).toSet();
+    _dialog<Set<String>>(
+      (context) => _MultiSelectDialog(
+        title: 'Choose warehouse storage',
+        items: _catalog.allProducts,
+        initialSelected: allIds,
+      ),
+    ).then((selected) {
+      if (!mounted || selected == null) return;
+      _placeBuilding(BuildingType.warehouse, x, y, selected);
+    });
+  }
+
+  void _placeBuilding(
+    BuildingType type,
+    int x,
+    int y,
+    Set<String> products, {
+    Set<String>? storeAccepts,
+  }) {
+    setState(() {
+      _cash -= type.cost;
+      _buildings.add(Building(
+        type,
+        x,
+        y,
+        products: products,
+        storeAccepts: storeAccepts,
+      ));
+      _selectedBuilding = null;
+    });
+    _recordTransaction(MarketTransaction(
+      day: _day,
+      type: TransactionType.buildingPurchase,
+      fromCity: 'Player',
+      toCity: '',
+      product: '',
+      units: 1,
+      unitPrice: type.cost.toDouble(),
+      amount: -type.cost,
+      profit: 0,
+      description: 'Purchased ${type.label}',
+      createdAt: DateTime.now(),
+    ));
+    _showPopup('Business established',
+        'Your new ${type.label.toLowerCase()} is operating.');
+  }
+
+  void _showBuildingPopup(Building building) {
+    _dialog<void>(
+      (context) => _BuildingDialog(
+        building: building,
+        catalog: _catalog,
+        onProductsChanged: building.type.isProducer
+            ? (products) => _changeProduction(building, products)
+            : null,
+        onStoreAcceptsChanged: building.type == BuildingType.store
+            ? (accepts) => _changeStoreInventory(building, accepts)
+            : null,
+        onWarehouseProductsChanged: building.type == BuildingType.warehouse
+            ? (products) => _changeWarehouseStorage(building, products)
+            : null,
+        onInputWarehouseChanged: building.type == BuildingType.factory
+            ? (warehouseId) => _changeInputWarehouse(building, warehouseId)
+            : null,
+        warehouses: _buildings
+            .where((b) => b.type == BuildingType.warehouse)
+            .toList(),
+        tiles: _tiles,
+      ),
+    );
+  }
+
+  void _changeProduction(Building building, Set<String> products) {
+    Future.microtask(() {
+      if (!mounted) return;
+      setState(() {
+        building.products
+          ..clear()
+          ..addAll(products);
+      });
+    });
+  }
+
+  void _changeStoreInventory(Building building, Set<String> accepts) {
+    Future.microtask(() {
+      if (!mounted) return;
+      setState(() {
+        building.storeAccepts
+          ..clear()
+          ..addAll(accepts);
+      });
+    });
+  }
+
+  void _changeWarehouseStorage(Building building, Set<String> products) {
+    Future.microtask(() {
+      if (!mounted) return;
+      setState(() {
+        building.products
+          ..clear()
+          ..addAll(products);
+      });
+    });
+  }
+
+  void _changeInputWarehouse(Building building, int warehouseId) {
+    Future.microtask(() {
+      if (!mounted) return;
+      setState(() {
+        building.inputWarehouseId = warehouseId;
+      });
+    });
   }
 
   void _advanceDay() {
@@ -391,6 +573,9 @@ class _GameScreenState extends State<GameScreen> {
       _tradesToday = 0;
       for (final city in _cities) {
         city.jobOpportunities = 0;
+        for (final product in _catalog.allProducts) {
+          city.produced[product.id] = 0;
+        }
       }
       _simulateProduction();
       _simulateTrade();
@@ -423,60 +608,134 @@ class _GameScreenState extends State<GameScreen> {
 
   void _simulateProduction() {
     for (final city in _cities) {
-      for (final product in ProductType.values) {
-        final buildingsHere = _buildings
-            .where((building) =>
-                (building.x - city.x).abs() <= 1 &&
-                (building.y - city.y).abs() <= 1)
-            .toList();
-        final production = buildingsHere
-            .where((building) =>
-                building.products.contains(product) &&
-                building.type.production > 0)
-            .fold<int>(
-              0,
-              (sum, building) => sum + building.type.production,
-            );
-        final produced = production;
-        city.jobOpportunities += buildingsHere.fold<int>(
-          0,
-          (sum, building) => sum + building.type.production,
-        );
-        city.stock[product] = (city.stock[product] ?? 0) + produced;
-        city.produced[product] = produced;
+      final buildingsHere = _buildingsNear(city);
+      city.jobOpportunities = buildingsHere.fold<int>(
+        0,
+        (sum, building) => sum + building.type.storageCapacity ~/ 10,
+      );
+
+      for (final building in buildingsHere) {
+        if (!building.type.isProducer) continue;
+
+        for (final productId in building.products) {
+          final def = _catalog.byId(productId);
+          if (def == null) continue;
+
+          // Factory: need inputs from warehouse
+          if (building.type == BuildingType.factory) {
+            final warehouse = _findInputWarehouse(building, city);
+            if (warehouse == null) continue;
+
+            var canProduce = true;
+            for (final entry in def.inputs.entries) {
+              final inputStock = city.stock[entry.key] ?? 0;
+              if (inputStock < entry.value) {
+                canProduce = false;
+                break;
+              }
+            }
+            if (!canProduce) continue;
+
+            // Consume inputs
+            for (final entry in def.inputs.entries) {
+              city.stock[entry.key] =
+                  (city.stock[entry.key] ?? 0) - entry.value;
+            }
+          }
+
+          // Produce output
+          final produced = def.outputPerDay;
+          city.stock[productId] = (city.stock[productId] ?? 0) + produced;
+          city.produced[productId] =
+              (city.produced[productId] ?? 0) + produced;
+
+          // Try to send surplus to connected warehouse
+          _sendToWarehouse(building, city, productId, produced);
+        }
       }
     }
   }
 
-  bool _canProduce(City city, ProductType product) => _buildings.any(
+  Building? _findInputWarehouse(Building factory, City city) {
+    if (factory.inputWarehouseId != null) {
+      final warehouse =
+          _buildings.where((b) => b.id == factory.inputWarehouseId).firstOrNull;
+      if (warehouse != null) return warehouse;
+    }
+    // Default: find nearest warehouse with road connection
+    final warehouses = _buildings
+        .where((b) => b.type == BuildingType.warehouse)
+        .where((b) =>
+            (b.x - factory.x).abs() <= 3 && (b.y - factory.y).abs() <= 3)
+        .toList();
+    if (warehouses.isNotEmpty) return warehouses.first;
+    return _buildings
+        .where((b) => b.type == BuildingType.warehouse)
+        .firstOrNull;
+  }
+
+  void _sendToWarehouse(
+      Building producer, City city, String productId, int amount) {
+    if (amount <= 0) return;
+    final warehouse = _buildings
+        .where((b) =>
+            b.type == BuildingType.warehouse &&
+            b.products.contains(productId) &&
+            _hasRoadConnection(city, _cityNearBuilding(b) ?? city))
+        .firstOrNull;
+    if (warehouse == null) return;
+
+    // Transfer half the production to warehouse stock
+    final transfer = (amount * 0.5).round();
+    final warehouseCity = _cityNearBuilding(warehouse);
+    if (warehouseCity == null) return;
+    if (warehouseCity == city) return;
+
+    final transferred = min(transfer, city.stock[productId] ?? 0);
+    if (transferred <= 0) return;
+
+    city.stock[productId] = (city.stock[productId] ?? 0) - transferred;
+    warehouseCity.stock[productId] =
+        (warehouseCity.stock[productId] ?? 0) + transferred;
+  }
+
+  City? _cityNearBuilding(Building building) {
+    return _cities.where((c) =>
+        (c.x - building.x).abs() <= 1 && (c.y - building.y).abs() <= 1).firstOrNull;
+  }
+
+  bool _canProduce(City city, String productId) => _buildings.any(
         (building) =>
             (building.x - city.x).abs() <= 1 &&
             (building.y - city.y).abs() <= 1 &&
-            building.products.contains(product) &&
-            building.type.production > 0,
+            building.products.contains(productId) &&
+            building.type.isProducer,
       );
 
-  bool _hasStore(City city, ProductType product) => _buildings.any(
+  bool _hasStoreSelling(City city, String productId) => _buildings.any(
         (building) =>
             (building.x - city.x).abs() <= 1 &&
             (building.y - city.y).abs() <= 1 &&
             building.type == BuildingType.store &&
-            building.products.contains(product),
+            building.storeAccepts.contains(productId),
       );
 
   void _simulateTrade() {
     for (final seller in _cities) {
       for (final buyer in seller.tradePartners) {
-        for (final product in ProductType.values) {
-          if (!_canProduce(seller, product)) continue;
-          final available = seller.stock[product] ?? 0;
+        for (final product in _catalog.allProducts) {
+          if (!_canProduce(seller, product.id)) continue;
+          if (!_hasStoreSelling(seller, product.id)) continue;
+          final available = seller.stock[product.id] ?? 0;
           final shortage = _consumerDemand(buyer, product) -
-              (buyer.stock[product] ?? 0);
+              (buyer.stock[product.id] ?? 0);
           final maxUnits = min(available, max(0, shortage));
           if (maxUnits < 2) continue;
 
-          final sellerPrice = seller.prices[product] ?? product.basePrice;
-          final buyerPrice = buyer.prices[product] ?? product.basePrice;
+          final sellerPrice =
+              seller.prices[product.id] ?? product.basePrice;
+          final buyerPrice =
+              buyer.prices[product.id] ?? product.basePrice;
           if (sellerPrice >= buyerPrice * 1.12) continue;
 
           final salaryFactor = (buyer.averageSalary / 1200).clamp(0.45, 2.5);
@@ -486,27 +745,29 @@ class _GameScreenState extends State<GameScreen> {
           );
           final unitPrice = sellerPrice * 1.05;
           final revenue = (unitPrice * units).round();
-          final profit = revenue - (product.basePrice * units * 0.65).round();
+          final profit =
+              revenue - (product.basePrice * units * 0.65).round();
 
-          seller.stock[product] = available - units;
-          buyer.stock[product] = (buyer.stock[product] ?? 0) + units;
-          buyer.prices[product] = (buyer.prices[product] ?? product.basePrice) *
-              0.94;
-          seller.prices[product] = (seller.prices[product] ?? product.basePrice) *
-              1.03;
+          seller.stock[product.id] = available - units;
+          buyer.stock[product.id] =
+              (buyer.stock[product.id] ?? 0) + units;
+          buyer.prices[product.id] =
+              (buyer.prices[product.id] ?? product.basePrice) * 0.94;
+          seller.prices[product.id] =
+              (seller.prices[product.id] ?? product.basePrice) * 1.03;
           _tradesToday++;
           _recordTransaction(MarketTransaction(
             day: _day,
             type: TransactionType.trade,
             fromCity: seller.name,
             toCity: buyer.name,
-            product: product.label,
+            product: product.name,
             units: units,
             unitPrice: unitPrice,
             amount: revenue,
             profit: profit,
             description:
-                '${seller.name} sold $units ${product.label} to ${buyer.name}',
+                '${seller.name} sold $units ${product.name} to ${buyer.name}',
             createdAt: DateTime.now(),
           ));
         }
@@ -514,26 +775,23 @@ class _GameScreenState extends State<GameScreen> {
     }
   }
 
-  int _consumerDemand(City city, ProductType product) {
-    final factor = switch (product) {
-      ProductType.bread => 0.18,
-      ProductType.fruit => 0.13,
-      ProductType.tools => 0.035,
-    };
-    return (city.population * factor).round();
+  int _consumerDemand(City city, ProductDefinition product) {
+    return (city.population * product.consumerDemand).round();
   }
 
   void _simulateConsumers() {
     for (final city in _cities) {
-      for (final product in ProductType.values) {
-        final price = city.prices[product] ?? product.basePrice;
-        final affordability = (product.basePrice / max(price, 0.1)).clamp(0.05, 1.2);
-        final demand = (_consumerDemand(city, product) * affordability).round();
-        if (!_hasStore(city, product)) continue;
-        final units = min(city.stock[product] ?? 0, demand);
+      for (final product in _catalog.allProducts) {
+        final price = city.prices[product.id] ?? product.basePrice;
+        final affordability =
+            (product.basePrice / max(price, 0.1)).clamp(0.05, 1.2);
+        final demand =
+            (_consumerDemand(city, product) * affordability).round();
+        if (!_hasStoreSelling(city, product.id)) continue;
+        final units = min(city.stock[product.id] ?? 0, demand);
         if (units <= 0) continue;
-        city.stock[product] = (city.stock[product] ?? 0) - units;
-        city.sold[product] = (city.sold[product] ?? 0) + units;
+        city.stock[product.id] = (city.stock[product.id] ?? 0) - units;
+        city.sold[product.id] = (city.sold[product.id] ?? 0) + units;
         final revenue = (price * units).round();
         final profit = (revenue * 0.22).round();
         if (city.name == 'Your Capital') _cash += profit;
@@ -542,13 +800,13 @@ class _GameScreenState extends State<GameScreen> {
           type: TransactionType.consumerSale,
           fromCity: city.name,
           toCity: 'Consumers',
-          product: product.label,
+          product: product.name,
           units: units,
           unitPrice: price,
           amount: revenue,
           profit: profit,
           description:
-              '${city.name} sold $units ${product.label} to consumers',
+              '${city.name} sold $units ${product.name} to consumers',
           createdAt: DateTime.now(),
         ));
       }
@@ -557,18 +815,22 @@ class _GameScreenState extends State<GameScreen> {
 
   void _updatePrices() {
     for (final city in _cities) {
-      for (final product in ProductType.values) {
-        final stock = city.stock[product] ?? 0;
-        final sold = city.sold[product] ?? 0;
-        final pressure = stock > 80 ? -0.04 : stock < 15 ? 0.07 : 0.0;
+      for (final product in _catalog.allProducts) {
+        final stock = city.stock[product.id] ?? 0;
+        final sold = city.sold[product.id] ?? 0;
+        final pressure =
+            stock > 80 ? -0.04 : stock < 15 ? 0.07 : 0.0;
         final demandPressure = sold > 0 ? 0.025 : -0.015;
-        final current = city.prices[product] ?? product.basePrice;
-        final next = (current * (1 + pressure + demandPressure)).clamp(
+        final current =
+            city.prices[product.id] ?? product.basePrice;
+        final next =
+            (current * (1 + pressure + demandPressure)).clamp(
           product.basePrice * 0.45,
           product.basePrice * 2.1,
         );
-        city.prices[product] = double.parse(next.toStringAsFixed(2));
-        city.sold[product] = 0;
+        city.prices[product.id] =
+            double.parse(next.toStringAsFixed(2));
+        city.sold[product.id] = 0;
       }
     }
   }
@@ -582,56 +844,42 @@ class _GameScreenState extends State<GameScreen> {
     });
   }
 
+  Future<T?> _dialog<T>(WidgetBuilder builder) {
+    return showDialog<T>(context: context, builder: builder).then((result) {
+      _lastDialogClosedAt = DateTime.now();
+      return result;
+    });
+  }
+
+  bool _dialogSettling() {
+    final last = _lastDialogClosedAt;
+    return last != null &&
+        DateTime.now().difference(last).inMilliseconds < 300;
+  }
+
   void _showTransactions() {
-    showDialog<void>(
-      context: context,
-      builder: (context) => const _TransactionsDialog(),
-    );
+    if (_dialogSettling()) return;
+    _dialog<void>((context) => const _TransactionsDialog());
   }
 
   void _selectBuildingType(BuildingType type) {
     setState(() {
-      if (_selectedBuilding == type) {
-        _selectedBuilding = null;
-        _selectedProducts.clear();
-      } else {
-        _selectedBuilding = type;
-        _selectedProducts
-          ..clear()
-          ..addAll(type.allowedProducts);
-      }
-    });
-  }
-
-  void _showProductPicker(BuildingType type) {
-    showDialog<Set<ProductType>>(
-      context: context,
-      builder: (context) => _ProductPickerDialog(
-        type: type,
-        initialProducts: _selectedProducts,
-      ),
-    ).then((products) {
-      if (!mounted || products == null) return;
-      setState(() {
-        _selectedProducts
-          ..clear()
-          ..addAll(products);
-      });
+      _selectedBuilding = _selectedBuilding == type ? null : type;
     });
   }
 
   void _showCityPopup(City city) {
-    showDialog<void>(
-      context: context,
-      builder: (context) => _CityDialog(city: city, buildings: _buildings),
+    _dialog<void>(
+      (context) =>
+          _CityDialog(city: city, buildings: _buildings, catalog: _catalog),
     );
   }
 
   void _showPopup(String title, String message) {
-    showDialog<void>(
-      context: context,
-      builder: (context) => AlertDialog(
-        icon: const Icon(Icons.info_outline_rounded, color: Color(0xFF167D5A)),
+    _dialog<void>(
+      (context) => AlertDialog(
+        icon:
+            const Icon(Icons.info_outline_rounded, color: Color(0xFF167D5A)),
         title: Text(title),
         content: Text(message),
         actions: [
@@ -660,6 +908,11 @@ class _GameScreenState extends State<GameScreen> {
 
   @override
   Widget build(BuildContext context) {
+    if (!_catalog.isLoaded) {
+      return const Scaffold(
+        body: Center(child: CircularProgressIndicator()),
+      );
+    }
     return Scaffold(
       appBar: AppBar(
         titleSpacing: 20,
@@ -669,7 +922,6 @@ class _GameScreenState extends State<GameScreen> {
           children: [
             Icon(Icons.storefront_rounded, color: Color(0xFF167D5A)),
             SizedBox(width: 10),
-            // Text('Market Simulation'),
           ],
         ),
         actions: [
@@ -720,9 +972,7 @@ class _GameScreenState extends State<GameScreen> {
                       Expanded(child: map),
                       _BuildBar(
                         selected: _selectedBuilding,
-                        selectedProducts: _selectedProducts,
                         onSelected: _selectBuildingType,
-                        onConfigureProducts: _showProductPicker,
                       ),
                     ],
                   );
@@ -732,9 +982,7 @@ class _GameScreenState extends State<GameScreen> {
                     Expanded(child: map),
                     _BuildSidebar(
                       selected: _selectedBuilding,
-                      selectedProducts: _selectedProducts,
                       onSelected: _selectBuildingType,
-                      onConfigureProducts: _showProductPicker,
                     ),
                   ],
                 );
@@ -743,6 +991,289 @@ class _GameScreenState extends State<GameScreen> {
           ),
         ],
       ),
+    );
+  }
+}
+
+class _MultiSelectDialog extends StatefulWidget {
+  const _MultiSelectDialog({
+    required this.title,
+    required this.items,
+    required this.initialSelected,
+  });
+
+  final String title;
+  final List<ProductDefinition> items;
+  final Set<String> initialSelected;
+
+  @override
+  State<_MultiSelectDialog> createState() => _MultiSelectDialogState();
+}
+
+class _MultiSelectDialogState extends State<_MultiSelectDialog> {
+  late final Set<String> _selected = Set.from(widget.initialSelected);
+
+  @override
+  Widget build(BuildContext context) {
+    return AlertDialog(
+      title: Text(widget.title),
+      content: SizedBox(
+        width: 380,
+        child: SingleChildScrollView(
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            children: widget.items.map((product) {
+              final selected = _selected.contains(product.id);
+              return CheckboxListTile(
+                contentPadding: EdgeInsets.zero,
+                value: selected,
+                secondary: Icon(product.icon),
+                title: Text(product.name),
+                onChanged: (value) => setState(() {
+                  if (value ?? false) {
+                    _selected.add(product.id);
+                  } else {
+                    _selected.remove(product.id);
+                  }
+                }),
+              );
+            }).toList(),
+          ),
+        ),
+      ),
+      actions: [
+        TextButton(
+          onPressed: () => Navigator.pop(context),
+          child: const Text('Cancel'),
+        ),
+        FilledButton(
+          onPressed: () => Navigator.pop(context, _selected),
+          child: const Text('Save'),
+        ),
+      ],
+    );
+  }
+}
+
+class _BuildingDialog extends StatelessWidget {
+  const _BuildingDialog({
+    required this.building,
+    required this.catalog,
+    this.onProductsChanged,
+    this.onStoreAcceptsChanged,
+    this.onWarehouseProductsChanged,
+    this.onInputWarehouseChanged,
+    this.warehouses = const [],
+    this.tiles = const {},
+  });
+
+  final Building building;
+  final ProductCatalog catalog;
+  final ValueChanged<Set<String>>? onProductsChanged;
+  final ValueChanged<Set<String>>? onStoreAcceptsChanged;
+  final ValueChanged<Set<String>>? onWarehouseProductsChanged;
+  final ValueChanged<int>? onInputWarehouseChanged;
+  final List<Building> warehouses;
+  final Map<String, Tile> tiles;
+
+  /// Pops this dialog, then opens the child selection dialog after the
+  /// parent route has fully completed its dismissal animation. This avoids
+  /// pushing a new route while the old one is mid-pop, which corrupts the
+  /// Focus scope dependencies.
+  void _openChildDialog(
+    BuildContext context,
+    String title,
+    List<ProductDefinition> items,
+    Set<String> initialSelected,
+    ValueChanged<Set<String>> onChanged,
+  ) {
+    Navigator.of(context).pop();
+    Future.delayed(const Duration(milliseconds: 350), () {
+      showDialog<Set<String>>(
+        context: MarketSimulationApp.navigatorKey.currentContext!,
+        builder: (context) => _MultiSelectDialog(
+          title: title,
+          items: items,
+          initialSelected: initialSelected,
+        ),
+      ).then((selected) {
+        if (selected != null) onChanged(selected);
+      });
+    });
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return AlertDialog(
+      title: Row(
+        children: [
+          Icon(building.type.icon, color: const Color(0xFF167D5A)),
+          const SizedBox(width: 10),
+          Expanded(child: Text(building.type.label)),
+        ],
+      ),
+      content: SizedBox(
+        width: 420,
+        child: SingleChildScrollView(
+          child: Column(
+            crossAxisAlignment: CrossAxisAlignment.start,
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              Text(
+                'Location: (${building.x}, ${building.y})',
+                style: const TextStyle(fontWeight: FontWeight.w600),
+              ),
+              const SizedBox(height: 12),
+
+              // Factory / Extractor production
+              if (building.type.isProducer) ...[
+                const Text('Produces',
+                    style: TextStyle(fontWeight: FontWeight.w800)),
+                const SizedBox(height: 6),
+                if (building.products.isEmpty)
+                  const Text('Nothing configured.',
+                      style: TextStyle(color: Color(0xFF8A5A00)))
+                else
+                  Wrap(
+                    spacing: 6,
+                    runSpacing: 6,
+                    children: building.products.map((id) {
+                      final def = catalog.byId(id);
+                      if (def == null) return const SizedBox.shrink();
+                      return Chip(
+                        avatar: Icon(def.icon, size: 17),
+                        label: Text(def.name),
+                      );
+                    }).toList(),
+                  ),
+                if (onProductsChanged != null) ...[
+                  const SizedBox(height: 8),
+                  OutlinedButton.icon(
+                    onPressed: () => _openChildDialog(
+                      context,
+                      'Change production',
+                      building.type == BuildingType.factory
+                          ? catalog.factoryProducts
+                          : catalog.extractorProducts,
+                      building.products,
+                      onProductsChanged!,
+                    ),
+                    icon: const Icon(Icons.edit_rounded, size: 17),
+                    label: const Text('Change production'),
+                  ),
+                ],
+                const SizedBox(height: 12),
+              ],
+
+              // Factory input warehouse
+              if (building.type == BuildingType.factory &&
+                  onInputWarehouseChanged != null) ...[
+                const Text('Input warehouse',
+                    style: TextStyle(fontWeight: FontWeight.w800)),
+                const SizedBox(height: 6),
+                DropdownButton<int>(
+                  isExpanded: true,
+                  value: building.inputWarehouseId,
+                  hint: const Text('Select warehouse'),
+                  items: warehouses.map((warehouse) {
+                    return DropdownMenuItem<int>(
+                      value: warehouse.id,
+                      child: Text(
+                        'Warehouse at (${warehouse.x}, ${warehouse.y})',
+                      ),
+                    );
+                  }).toList(),
+                  onChanged: (value) {
+                    if (value != null) onInputWarehouseChanged!(value);
+                  },
+                ),
+                const SizedBox(height: 12),
+              ],
+
+              // Store inventory
+              if (building.type == BuildingType.store) ...[
+                const Text('Sells',
+                    style: TextStyle(fontWeight: FontWeight.w800)),
+                const SizedBox(height: 6),
+                if (building.storeAccepts.isEmpty)
+                  const Text('Nothing configured.',
+                      style: TextStyle(color: Color(0xFF8A5A00)))
+                else
+                  Wrap(
+                    spacing: 6,
+                    runSpacing: 6,
+                    children: building.storeAccepts.map((id) {
+                      final def = catalog.byId(id);
+                      if (def == null) return const SizedBox.shrink();
+                      return Chip(
+                        avatar: Icon(def.icon, size: 17),
+                        label: Text(def.name),
+                      );
+                    }).toList(),
+                  ),
+                if (onStoreAcceptsChanged != null) ...[
+                  const SizedBox(height: 8),
+                  OutlinedButton.icon(
+                    onPressed: () => _openChildDialog(
+                      context,
+                      'Change store inventory',
+                      catalog.allProducts,
+                      building.storeAccepts,
+                      onStoreAcceptsChanged!,
+                    ),
+                    icon: const Icon(Icons.edit_rounded, size: 17),
+                    label: const Text('Change inventory'),
+                  ),
+                ],
+                const SizedBox(height: 12),
+              ],
+
+              // Warehouse storage
+              if (building.type == BuildingType.warehouse) ...[
+                const Text('Stores',
+                    style: TextStyle(fontWeight: FontWeight.w800)),
+                const SizedBox(height: 6),
+                if (building.products.isEmpty)
+                  const Text('Nothing configured.',
+                      style: TextStyle(color: Color(0xFF8A5A00)))
+                else
+                  Wrap(
+                    spacing: 6,
+                    runSpacing: 6,
+                    children: building.products.map((id) {
+                      final def = catalog.byId(id);
+                      if (def == null) return const SizedBox.shrink();
+                      return Chip(
+                        avatar: Icon(def.icon, size: 17),
+                        label: Text(def.name),
+                      );
+                    }).toList(),
+                  ),
+                if (onWarehouseProductsChanged != null) ...[
+                  const SizedBox(height: 8),
+                  OutlinedButton.icon(
+                    onPressed: () => _openChildDialog(
+                      context,
+                      'Change warehouse storage',
+                      catalog.allProducts,
+                      building.products,
+                      onWarehouseProductsChanged!,
+                    ),
+                    icon: const Icon(Icons.edit_rounded, size: 17),
+                    label: const Text('Change storage'),
+                  ),
+                ],
+              ],
+            ],
+          ),
+        ),
+      ),
+      actions: [
+        FilledButton(
+          onPressed: () => Navigator.pop(context),
+          child: const Text('Close'),
+        ),
+      ],
     );
   }
 }
@@ -818,7 +1349,8 @@ class _TransactionsDialogState extends State<_TransactionsDialog> {
                   }
                   if (snapshot.hasError) {
                     return Center(
-                      child: Text('Could not load transactions:\n${snapshot.error}'),
+                      child: Text(
+                          'Could not load transactions:\n${snapshot.error}'),
                     );
                   }
                   final transactions = snapshot.data ?? const [];
@@ -829,17 +1361,21 @@ class _TransactionsDialogState extends State<_TransactionsDialog> {
                   }
                   return ListView.separated(
                     itemCount: transactions.length,
-                    separatorBuilder: (_, _) => const Divider(height: 1),
+                    separatorBuilder: (_, index) => const Divider(height: 1),
                     itemBuilder: (context, index) {
                       final transaction = transactions[index];
                       return ListTile(
                         dense: true,
                         leading: Icon(
                           switch (transaction.type) {
-                            TransactionType.trade => Icons.swap_horiz_rounded,
-                            TransactionType.consumerSale => Icons.shopping_bag_rounded,
-                            TransactionType.buildingPurchase => Icons.domain_rounded,
-                            TransactionType.revenue => Icons.attach_money_rounded,
+                            TransactionType.trade =>
+                              Icons.swap_horiz_rounded,
+                            TransactionType.consumerSale =>
+                              Icons.shopping_bag_rounded,
+                            TransactionType.buildingPurchase =>
+                              Icons.domain_rounded,
+                            TransactionType.revenue =>
+                              Icons.attach_money_rounded,
                           },
                         ),
                         title: Text(transaction.description),
@@ -884,17 +1420,22 @@ class _TransactionsDialogState extends State<_TransactionsDialog> {
 }
 
 class _CityDialog extends StatelessWidget {
-  const _CityDialog({required this.city, required this.buildings});
+  const _CityDialog({
+    required this.city,
+    required this.buildings,
+    required this.catalog,
+  });
 
   final City city;
   final List<Building> buildings;
+  final ProductCatalog catalog;
 
-  bool _hasStore(City city, ProductType product) => buildings.any(
+  bool _hasStoreSelling(City city, String productId) => buildings.any(
         (building) =>
             (building.x - city.x).abs() <= 1 &&
             (building.y - city.y).abs() <= 1 &&
             building.type == BuildingType.store &&
-            building.products.contains(product),
+            building.storeAccepts.contains(productId),
       );
 
   int _nearbyWorkOpportunities(City city) {
@@ -943,13 +1484,14 @@ class _CityDialog extends StatelessWidget {
                 ),
               ),
               const SizedBox(height: 16),
-              const Text('Local market', style: TextStyle(fontWeight: FontWeight.w800)),
+              const Text('Local market',
+                  style: TextStyle(fontWeight: FontWeight.w800)),
               const SizedBox(height: 8),
-              ...ProductType.values.map(
+              ...catalog.allProducts.map(
                 (product) {
-                  final producerUnits = city.produced[product] ?? 0;
+                  final producerUnits = city.produced[product.id] ?? 0;
                   final hasProducer = producerUnits > 0;
-                  final hasStore = _hasStore(city, product);
+                  final hasStore = _hasStoreSelling(city, product.id);
                   return Padding(
                     padding: const EdgeInsets.only(bottom: 10),
                     child: Column(
@@ -959,24 +1501,30 @@ class _CityDialog extends StatelessWidget {
                           children: [
                             Icon(product.icon, size: 19),
                             const SizedBox(width: 8),
-                            Expanded(child: Text(product.label)),
-                            Text('${city.stock[product] ?? 0} in stock'),
+                            Expanded(child: Text(product.name)),
+                            Text(
+                                '${city.stock[product.id] ?? 0} in stock'),
                             const SizedBox(width: 12),
                             SizedBox(
                               width: 60,
                               child: Text(
-                                '\$${(city.prices[product] ?? 0).toStringAsFixed(2)}',
+                                '\$${(city.prices[product.id] ?? 0).toStringAsFixed(2)}',
                                 textAlign: TextAlign.right,
-                                style: const TextStyle(fontWeight: FontWeight.w800),
+                                style: const TextStyle(
+                                    fontWeight: FontWeight.w800),
                               ),
                             ),
                           ],
                         ),
                         const SizedBox(height: 3),
                         Text(
-                          hasProducer
-                              ? '$producerUnits producer units/day · ${hasStore ? 'Store selling' : 'No store'}'
-                              : 'No producer · ${hasStore ? 'Store selling' : 'No store'}',
+                          hasProducer && hasStore
+                              ? '$producerUnits producer units/day · Store selling'
+                              : hasProducer
+                                  ? '$producerUnits producer units/day · No store (cannot sell)'
+                                  : hasStore
+                                      ? 'No producer · Store selling'
+                                      : 'No producer · No store',
                           style: TextStyle(
                             fontSize: 11,
                             color: hasProducer && hasStore
@@ -991,11 +1539,14 @@ class _CityDialog extends StatelessWidget {
                 },
               ),
               const SizedBox(height: 8),
-              const Text('City businesses', style: TextStyle(fontWeight: FontWeight.w800)),
+              const Text('City businesses',
+                  style: TextStyle(fontWeight: FontWeight.w800)),
               const SizedBox(height: 8),
-              ...buildings.where((building) =>
-                  (building.x - city.x).abs() <= 1 &&
-                  (building.y - city.y).abs() <= 1).map(
+              ...buildings
+                  .where((building) =>
+                      (building.x - city.x).abs() <= 1 &&
+                      (building.y - city.y).abs() <= 1)
+                  .map(
                 (building) => Padding(
                   padding: const EdgeInsets.only(bottom: 6),
                   child: Row(
@@ -1005,38 +1556,50 @@ class _CityDialog extends StatelessWidget {
                       Expanded(child: Text(building.type.label)),
                       Flexible(
                         child: Text(
-                          building.products.isEmpty
-                              ? 'No products selected'
-                              : building.products
-                                  .map((product) => product.label)
-                                  .join(', '),
+                          building.type.isProducer &&
+                                  building.products.isNotEmpty
+                              ? building.products
+                                  .map((id) =>
+                                      catalog.byId(id)?.name ?? id)
+                                  .join(', ')
+                              : building.type == BuildingType.store &&
+                                      building.storeAccepts.isNotEmpty
+                                  ? building.storeAccepts
+                                      .map((id) =>
+                                          catalog.byId(id)?.name ?? id)
+                                      .join(', ')
+                                  : building.type ==
+                                              BuildingType.warehouse &&
+                                          building.products.isNotEmpty
+                                      ? building.products
+                                          .map((id) =>
+                                              catalog.byId(id)?.name ??
+                                              id)
+                                          .join(', ')
+                                      : 'No products configured',
                           textAlign: TextAlign.right,
                           style: const TextStyle(fontSize: 11),
                         ),
                       ),
-                      if (building.type.production > 0) ...[
-                        const SizedBox(width: 8),
-                        Text(
-                          '${building.type.production} units/day',
-                          style: const TextStyle(fontSize: 11),
-                        ),
-                      ],
                     ],
                   ),
                 ),
               ),
               const Divider(height: 24),
-              const Text('Trade partners', style: TextStyle(fontWeight: FontWeight.w800)),
+              const Text('Trade partners',
+                  style: TextStyle(fontWeight: FontWeight.w800)),
               const SizedBox(height: 8),
               if (city.tradePartners.isEmpty)
-                const Text('No connected cities. Trade requires a road connection.')
+                const Text(
+                    'No connected cities. Trade requires a road connection.')
               else
                 Wrap(
                   spacing: 8,
                   runSpacing: 8,
                   children: city.tradePartners
                       .map((partner) => Chip(
-                            avatar: const Icon(Icons.route_rounded, size: 17),
+                            avatar: const Icon(Icons.route_rounded,
+                                size: 17),
                             label: Text(partner.name),
                           ))
                       .toList(),
@@ -1111,14 +1674,20 @@ class _StatsBar extends StatelessWidget {
         spacing: 24,
         runSpacing: 8,
         children: [
-          _Stat(icon: Icons.location_city_rounded, label: '$cities cities'),
-          _Stat(icon: Icons.apartment_rounded, label: '$businesses businesses'),
-          _Stat(icon: Icons.calendar_today_rounded, label: 'Day $day'),
+          _Stat(
+              icon: Icons.location_city_rounded, label: '$cities cities'),
+          _Stat(
+              icon: Icons.apartment_rounded,
+              label: '$businesses businesses'),
+          _Stat(
+              icon: Icons.calendar_today_rounded, label: 'Day $day'),
           _Stat(
             icon: Icons.people_alt_rounded,
             label: '${NumberFormat.compact(consumers)} consumers',
           ),
-          _Stat(icon: Icons.swap_horiz_rounded, label: '$trades trades today'),
+          _Stat(
+              icon: Icons.swap_horiz_rounded,
+              label: '$trades trades today'),
         ],
       ),
     );
@@ -1180,6 +1749,15 @@ class _MapViewState extends State<_MapView> {
   Color Function(Terrain) get _terrainColor => widget.terrainColor;
   IconData? Function(int, int) get _buildingIcon => widget.buildingIcon;
 
+  int _roadNeighbors(int x, int y) {
+    var mask = 0;
+    if (_tiles['$x,${y - 1}']?.road ?? false) mask |= 1; // North
+    if (_tiles['${x + 1},$y']?.road ?? false) mask |= 2; // East
+    if (_tiles['$x,${y + 1}']?.road ?? false) mask |= 4; // South
+    if (_tiles['${x - 1},$y']?.road ?? false) mask |= 8; // West
+    return mask;
+  }
+
   @override
   void dispose() {
     _transformController.dispose();
@@ -1240,8 +1818,8 @@ class _MapViewState extends State<_MapView> {
                             SliverGridDelegateWithFixedCrossAxisCount(
                           crossAxisCount: _GameScreenState.mapWidth,
                         ),
-                        itemCount:
-                            _GameScreenState.mapWidth * _GameScreenState.mapHeight,
+                        itemCount: _GameScreenState.mapWidth *
+                            _GameScreenState.mapHeight,
                         itemBuilder: (context, index) {
                           final x = index % _GameScreenState.mapWidth;
                           final y = index ~/ _GameScreenState.mapWidth;
@@ -1259,19 +1837,12 @@ class _MapViewState extends State<_MapView> {
                               child: Stack(
                                 children: [
                                   if (tile.road)
-                                    Align(
-                                      alignment: Alignment.center,
-                                      child: FractionallySizedBox(
-                                        widthFactor: 0.9,
-                                        child: Container(
-                                          height: tileSize * 0.16,
-                                          decoration: BoxDecoration(
-                                            color: const Color(0xFFD2B48C),
-                                            borderRadius:
-                                                BorderRadius.circular(4),
-                                          ),
-                                        ),
+                                    CustomPaint(
+                                      painter: _RoadPainter(
+                                        neighbors: _roadNeighbors(x, y),
+                                        tileSize: tileSize,
                                       ),
+                                      size: Size.square(tileSize),
                                     ),
                                   if (_buildingIcon(x, y) != null)
                                     Align(
@@ -1352,18 +1923,73 @@ class _MapViewState extends State<_MapView> {
   }
 }
 
+class _RoadPainter extends CustomPainter {
+  const _RoadPainter({
+    required this.neighbors,
+    required this.tileSize,
+  });
+
+  final int neighbors;
+  final double tileSize;
+
+  @override
+  void paint(Canvas canvas, Size size) {
+    final center = size.center(Offset.zero);
+    final roadWidth = tileSize * 0.14;
+    final glowWidth = roadWidth * 2.4;
+
+    final glowPaint = Paint()
+      ..color = const Color(0x33D2B48C)
+      ..strokeWidth = glowWidth
+      ..strokeCap = StrokeCap.round;
+
+    final roadPaint = Paint()
+      ..color = const Color(0xFFD2B48C)
+      ..strokeWidth = roadWidth
+      ..strokeCap = StrokeCap.round;
+
+    _drawConnections(canvas, center, roadWidth, glowPaint);
+    _drawConnections(canvas, center, roadWidth, roadPaint);
+  }
+
+  void _drawConnections(
+      Canvas canvas, Offset center, double width, Paint paint) {
+    if (neighbors & 1 != 0) {
+      canvas.drawLine(
+          center + Offset(0, -tileSize / 2), center, paint);
+    }
+    if (neighbors & 2 != 0) {
+      canvas.drawLine(
+          center + Offset(tileSize / 2, 0), center, paint);
+    }
+    if (neighbors & 4 != 0) {
+      canvas.drawLine(
+          center + Offset(0, tileSize / 2), center, paint);
+    }
+    if (neighbors & 8 != 0) {
+      canvas.drawLine(
+          center + Offset(-tileSize / 2, 0), center, paint);
+    }
+    if (neighbors == 0) {
+      canvas.drawCircle(center, width * 0.5, paint);
+    }
+  }
+
+  @override
+  bool shouldRepaint(covariant _RoadPainter oldDelegate) {
+    return oldDelegate.neighbors != neighbors ||
+        oldDelegate.tileSize != tileSize;
+  }
+}
+
 class _BuildBar extends StatelessWidget {
   const _BuildBar({
     required this.selected,
-    required this.selectedProducts,
     required this.onSelected,
-    required this.onConfigureProducts,
   });
 
   final BuildingType? selected;
-  final Set<ProductType> selectedProducts;
   final ValueChanged<BuildingType> onSelected;
-  final ValueChanged<BuildingType> onConfigureProducts;
 
   @override
   Widget build(BuildContext context) {
@@ -1373,34 +1999,20 @@ class _BuildBar extends StatelessWidget {
         color: Colors.white,
         child: Padding(
           padding: const EdgeInsets.fromLTRB(12, 12, 12, 16),
-          child: Column(
-            mainAxisSize: MainAxisSize.min,
-            crossAxisAlignment: CrossAxisAlignment.start,
-            children: [
-              SingleChildScrollView(
-                scrollDirection: Axis.horizontal,
-                child: Row(
-                  children: BuildingType.values
-                      .map((type) => Padding(
-                            padding: const EdgeInsets.only(right: 8),
-                            child: _BuildButton(
-                              type: type,
-                              selected: selected == type,
-                              onTap: () => onSelected(type),
-                            ),
-                          ))
-                      .toList(),
-                ),
-              ),
-              if (selected != null) ...[
-                const SizedBox(height: 10),
-                _ProductSelector(
-                  type: selected!,
-                  selectedProducts: selectedProducts,
-                  onConfigure: () => onConfigureProducts(selected!),
-                ),
-              ],
-            ],
+          child: SingleChildScrollView(
+            scrollDirection: Axis.horizontal,
+            child: Row(
+              children: BuildingType.values
+                  .map((type) => Padding(
+                        padding: const EdgeInsets.only(right: 8),
+                        child: _BuildButton(
+                          type: type,
+                          selected: selected == type,
+                          onTap: () => onSelected(type),
+                        ),
+                      ))
+                  .toList(),
+            ),
           ),
         ),
       ),
@@ -1411,15 +2023,11 @@ class _BuildBar extends StatelessWidget {
 class _BuildSidebar extends StatelessWidget {
   const _BuildSidebar({
     required this.selected,
-    required this.selectedProducts,
     required this.onSelected,
-    required this.onConfigureProducts,
   });
 
   final BuildingType? selected;
-  final Set<ProductType> selectedProducts;
   final ValueChanged<BuildingType> onSelected;
-  final ValueChanged<BuildingType> onConfigureProducts;
 
   @override
   Widget build(BuildContext context) {
@@ -1431,7 +2039,8 @@ class _BuildSidebar extends StatelessWidget {
         crossAxisAlignment: CrossAxisAlignment.start,
         children: [
           const Text('Build business',
-              style: TextStyle(fontSize: 20, fontWeight: FontWeight.w800)),
+              style:
+                  TextStyle(fontSize: 20, fontWeight: FontWeight.w800)),
           const SizedBox(height: 6),
           const Text(
             'Choose a business, then select an available tile on the map.',
@@ -1449,14 +2058,6 @@ class _BuildSidebar extends StatelessWidget {
               ),
             ),
           ),
-          if (selected != null) ...[
-            const SizedBox(height: 8),
-            _ProductSelector(
-              type: selected!,
-              selectedProducts: selectedProducts,
-              onConfigure: () => onConfigureProducts(selected!),
-            ),
-          ],
           const Spacer(),
           const _MarketSummary(),
           const SizedBox(height: 16),
@@ -1482,155 +2083,13 @@ class _MarketSummary extends StatelessWidget {
             SizedBox(width: 9),
             Expanded(
               child: Text(
-                'Factories and extractors produce goods. Stores sell to consumers. Cities trade products they produce through roads.',
+                'Extractors produce raw materials. Factories produce goods from inputs. Stores sell to consumers. Warehouses store and transfer goods.',
                 style: TextStyle(fontSize: 12, height: 1.35),
               ),
             ),
           ],
         ),
       ),
-    );
-  }
-}
-
-class _ProductSelector extends StatelessWidget {
-  const _ProductSelector({
-    required this.type,
-    required this.selectedProducts,
-    required this.onConfigure,
-  });
-
-  final BuildingType type;
-  final Set<ProductType> selectedProducts;
-  final VoidCallback onConfigure;
-
-  String get _title => switch (type) {
-        BuildingType.factory => 'Factory production',
-        BuildingType.extractor => 'Extractor output',
-        BuildingType.store => 'Store inventory',
-        BuildingType.company => 'Company inventory',
-        BuildingType.warehouse => 'Warehouse inventory',
-      };
-
-  @override
-  Widget build(BuildContext context) {
-    final selectedLabels = selectedProducts
-        .map((product) => product.label)
-        .join(', ');
-    return Container(
-      width: double.infinity,
-      padding: const EdgeInsets.all(12),
-      decoration: BoxDecoration(
-        color: const Color(0xFFF7F9FC),
-        borderRadius: BorderRadius.circular(14),
-        border: Border.all(color: const Color(0xFFD9E2EC)),
-      ),
-      child: Row(
-        children: [
-          Expanded(
-            child: Column(
-              crossAxisAlignment: CrossAxisAlignment.start,
-              children: [
-                Text(_title, style: const TextStyle(fontWeight: FontWeight.w800)),
-                const SizedBox(height: 3),
-                Text(
-                  selectedLabels.isEmpty
-                      ? 'No products selected'
-                      : selectedLabels,
-                  style: const TextStyle(fontSize: 12),
-                ),
-              ],
-            ),
-          ),
-          const SizedBox(width: 10),
-          FilledButton.tonalIcon(
-            onPressed: onConfigure,
-            icon: const Icon(Icons.tune_rounded, size: 18),
-            label: const Text('Configure'),
-          ),
-        ],
-      ),
-    );
-  }
-}
-
-class _ProductPickerDialog extends StatefulWidget {
-  const _ProductPickerDialog({
-    required this.type,
-    required this.initialProducts,
-  });
-
-  final BuildingType type;
-  final Set<ProductType> initialProducts;
-
-  @override
-  State<_ProductPickerDialog> createState() => _ProductPickerDialogState();
-}
-
-class _ProductPickerDialogState extends State<_ProductPickerDialog> {
-  late final Set<ProductType> _products =
-      Set<ProductType>.from(widget.initialProducts);
-
-  String get _title => switch (widget.type) {
-        BuildingType.factory => 'Select factory production',
-        BuildingType.extractor => 'Select extractor output',
-        BuildingType.store => 'Select products the store accepts',
-        BuildingType.company => 'Select products the company accepts',
-        BuildingType.warehouse => 'Select products the warehouse accepts',
-      };
-
-  @override
-  Widget build(BuildContext context) {
-    return AlertDialog(
-      title: Text(_title),
-      content: SizedBox(
-        width: 390,
-        child: Column(
-          mainAxisSize: MainAxisSize.min,
-          children: [
-            const Text(
-              'Choose the products this business will handle.',
-              style: TextStyle(height: 1.4),
-            ),
-            const SizedBox(height: 16),
-            ...widget.type.allowedProducts.map(
-              (product) => CheckboxListTile(
-                contentPadding: EdgeInsets.zero,
-                value: _products.contains(product),
-                secondary: Icon(product.icon),
-                title: Text(product.label),
-                subtitle: Text(
-                  switch (widget.type) {
-                    BuildingType.factory => 'Produces this product',
-                    BuildingType.extractor => 'Extracts this resource',
-                    BuildingType.store => 'Accepts and sells this product',
-                    _ => 'Accepts and stores this product',
-                  },
-                ),
-                onChanged: (selected) => setState(() {
-                  if (selected ?? false) {
-                    _products.add(product);
-                  } else {
-                    _products.remove(product);
-                  }
-                }),
-              ),
-            ),
-          ],
-        ),
-      ),
-      actions: [
-        TextButton(
-          onPressed: () => Navigator.pop(context),
-          child: const Text('Cancel'),
-        ),
-        FilledButton(
-          onPressed: () {
-            Navigator.pop(context, _products);
-          },
-          child: const Text('Save products'),
-        ),
-      ],
     );
   }
 }
@@ -1669,7 +2128,8 @@ class _BuildButton extends StatelessWidget {
           ),
         ),
         child: Row(
-          mainAxisSize: expanded ? MainAxisSize.max : MainAxisSize.min,
+          mainAxisSize:
+              expanded ? MainAxisSize.max : MainAxisSize.min,
           children: [
             Container(
               width: 38,
@@ -1682,7 +2142,9 @@ class _BuildButton extends StatelessWidget {
               ),
               child: Icon(
                 type.icon,
-                color: selected ? Colors.white : const Color(0xFF486581),
+                color: selected
+                    ? Colors.white
+                    : const Color(0xFF486581),
               ),
             ),
             const SizedBox(width: 10),
@@ -1692,10 +2154,11 @@ class _BuildButton extends StatelessWidget {
                 children: [
                   Text(
                     type.label,
-                    style: const TextStyle(fontWeight: FontWeight.w800),
+                    style: const TextStyle(
+                        fontWeight: FontWeight.w800),
                   ),
                   Text(
-                    '\$${type.cost} · ${type.production > 0 ? '${type.production} units/day' : 'retail service'}',
+                    '\$${type.cost}',
                     style: const TextStyle(fontSize: 12),
                   ),
                 ],
@@ -1705,7 +2168,9 @@ class _BuildButton extends StatelessWidget {
         ),
       ),
     );
-    return expanded ? SizedBox(width: double.infinity, child: content) : content;
+    return expanded
+        ? SizedBox(width: double.infinity, child: content)
+        : content;
   }
 }
 
@@ -1718,10 +2183,14 @@ class _MapLegend extends StatelessWidget {
       spacing: 12,
       runSpacing: 8,
       children: [
-        _LegendItem(color: Color(0xFFB7D7A8), label: 'Grass'),
-        _LegendItem(color: Color(0xFF6EA879), label: 'Forest'),
-        _LegendItem(color: Color(0xFF8BC5D6), label: 'Water'),
-        _LegendItem(color: Color(0xFFAAA39A), label: 'Mountain'),
+        _LegendItem(
+            color: Color(0xFFB7D7A8), label: 'Grass'),
+        _LegendItem(
+            color: Color(0xFF6EA879), label: 'Forest'),
+        _LegendItem(
+            color: Color(0xFF8BC5D6), label: 'Water'),
+        _LegendItem(
+            color: Color(0xFFAAA39A), label: 'Mountain'),
       ],
     );
   }
@@ -1741,7 +2210,8 @@ class _LegendItem extends StatelessWidget {
         Container(
           width: 12,
           height: 12,
-          decoration: BoxDecoration(color: color, shape: BoxShape.circle),
+          decoration:
+              BoxDecoration(color: color, shape: BoxShape.circle),
         ),
         const SizedBox(width: 5),
         Text(label, style: const TextStyle(fontSize: 12)),

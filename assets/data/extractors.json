@@ -1,0 +1,11 @@
+{
+  "products": [
+    { "id": "wood", "name": "Wood", "basePrice": 3.0, "outputPerDay": 22, "consumerDemand": 0.010 },
+    { "id": "aluminium", "name": "Aluminium", "basePrice": 12.0, "outputPerDay": 8, "consumerDemand": 0.002 },
+    { "id": "iron", "name": "Iron", "basePrice": 9.0, "outputPerDay": 10, "consumerDemand": 0.003 },
+    { "id": "stone", "name": "Stone", "basePrice": 4.0, "outputPerDay": 18, "consumerDemand": 0.004 },
+    { "id": "grain", "name": "Grain", "basePrice": 2.5, "outputPerDay": 24, "consumerDemand": 0.050 },
+    { "id": "fruit", "name": "Fruit", "basePrice": 5.0, "outputPerDay": 16, "consumerDemand": 0.100 },
+    { "id": "cotton", "name": "Cotton", "basePrice": 6.0, "outputPerDay": 12, "consumerDemand": 0.004 }
+  ]
+}
