@@ -681,7 +681,8 @@ class _GameScreenState extends State<GameScreen> {
         .where((b) =>
             b.type == BuildingType.warehouse &&
             b.products.contains(productId) &&
-            _hasRoadConnection(city, _cityNearBuilding(b) ?? city))
+            (_cityNearBuilding(b) == city ||
+                _hasRoadConnection(city, _cityNearBuilding(b) ?? city)))
         .firstOrNull;
     if (warehouse == null) return;
 
@@ -689,7 +690,6 @@ class _GameScreenState extends State<GameScreen> {
     final transfer = (amount * 0.5).round();
     final warehouseCity = _cityNearBuilding(warehouse);
     if (warehouseCity == null) return;
-    if (warehouseCity == city) return;
 
     final transferred = min(transfer, city.stock[productId] ?? 0);
     if (transferred <= 0) return;
